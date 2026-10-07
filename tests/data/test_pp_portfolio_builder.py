@@ -317,3 +317,40 @@ def test_transfer_target_account_from_cross_entry(request: TopRequest) -> None: 
     buy = transactions[transactions['type'] == TransactionType.BUY.value]
     assert pd.isna(buy.iloc[0]['transferTargetAccount'])
     assert pd.isna(buy.iloc[0]['transferTargetShares'])
+
+
+def test_converted_gross_value_only_applies_to_securities_transactions() -> None:
+    """Deposit transactions stay in the account currency; only securities transactions take the forex gross value."""
+    db = Ppxml2dbWrapper(dbname=DB_NAME_IN_MEMORY)
+    conn = db.connection
+    conn.executescript("""
+        INSERT INTO property(name, value) VALUES ('baseCurrency', 'EUR');
+        INSERT INTO account(_id, uuid, type, name, currency, updatedAt, _xmlid, _order) VALUES
+            (1, 'cash-eur', 'account', 'Cash EUR', 'EUR', '2020', 1, 1),
+            (2, 'cash-usd', 'account', 'Cash USD', 'USD', '2020', 2, 2),
+            (3, 'depot', 'portfolio', 'Depot', NULL, '2020', 3, 3);
+        INSERT INTO security(_id, uuid, name, currency, updatedAt) VALUES
+            (1, 'sec-usd', 'US Stock', 'USD', '2020'),
+            (2, 'sec-eur', 'EU Stock', 'EUR', '2020');
+        INSERT INTO xact(_id, uuid, acctype, account, date, currency, amount, security, shares, type, updatedAt, _xmlid, _order) VALUES
+            (1, 'x-out', 'account', 'cash-eur', '2020-01-15', 'EUR', 90000, NULL, 0, 'TRANSFER_OUT', '2020', 1, 1),
+            (2, 'x-in', 'account', 'cash-usd', '2020-01-15', 'USD', 100000, NULL, 0, 'TRANSFER_IN', '2020', 2, 2),
+            (3, 'x-div', 'account', 'cash-usd', '2020-02-15', 'USD', 1100, 'sec-eur', 0, 'DIVIDENDS', '2020', 3, 3),
+            (4, 'x-buy', 'portfolio', 'depot', '2020-03-15', 'EUR', 90000, 'sec-usd', 1000000000, 'BUY', '2020', 4, 4);
+        INSERT INTO xact_unit(xact, type, amount, currency, forex_amount, forex_currency, exchangeRate) VALUES
+            ('x-out', 'GROSS_VALUE', 90000, 'EUR', 100000, 'USD', '0.9'),
+            ('x-div', 'GROSS_VALUE', 1100, 'USD', 1000, 'EUR', '1.1'),
+            ('x-buy', 'GROSS_VALUE', 90000, 'EUR', 100000, 'USD', '0.9');
+    """)
+    conn.commit()
+
+    db.open = lambda _: None  # type: ignore  # DB already seeded, skip XML parsing
+    portfolio = PpPortfolioBuilder(db).construct(Path('unused.xml'))
+
+    deposit_transactions = portfolio.deposit_account_transactions.set_index('uuid')
+    assert deposit_transactions.loc['x-out', ['currency', 'amount']].tolist() == ['EUR', -900.0]
+    assert deposit_transactions.loc['x-in', ['currency', 'amount']].tolist() == ['USD', 1000.0]
+    assert deposit_transactions.loc['x-div', ['currency', 'amount']].tolist() == ['USD', 11.0]
+
+    buy = portfolio.securities_account_transactions.set_index('uuid').loc['x-buy']
+    assert [buy['currency'], buy['amount']] == ['USD', -1000.0]
